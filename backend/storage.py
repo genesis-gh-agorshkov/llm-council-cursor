@@ -34,7 +34,8 @@ def create_conversation(conversation_id: str) -> Dict[str, Any]:
         "id": conversation_id,
         "created_at": datetime.utcnow().isoformat(),
         "title": "New Conversation",
-        "messages": []
+        "messages": [],
+        "workspace": None  # Workspace directory path
     }
 
     # Save to file
@@ -169,4 +170,20 @@ def update_conversation_title(conversation_id: str, title: str):
         raise ValueError(f"Conversation {conversation_id} not found")
 
     conversation["title"] = title
+    save_conversation(conversation)
+
+
+def update_conversation_workspace(conversation_id: str, workspace: Optional[str]):
+    """
+    Update the workspace directory for a conversation.
+
+    Args:
+        conversation_id: Conversation identifier
+        workspace: Workspace directory path (or None)
+    """
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+
+    conversation["workspace"] = workspace
     save_conversation(conversation)

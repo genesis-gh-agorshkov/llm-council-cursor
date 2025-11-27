@@ -43,3 +43,8 @@ DATA_DIR = "data/conversations"
 
 # Temporary directory for Cursor CLI outputs
 CURSOR_OUTPUT_DIR = "data/cursor_outputs"
+
+# Workspace directory for Cursor CLI commands
+# Set this to the project path you want models to have context about
+# Can be set via CURSOR_WORKSPACE environment variable, or defaults to None (current directory)
+CURSOR_WORKSPACE = os.getenv("CURSOR_WORKSPACE", None)

@@ -5,7 +5,7 @@ import tempfile
 import os
 import logging
 from typing import List, Dict, Any, Optional
-from .config import CURSOR_MODEL_MAP
+from .config import CURSOR_MODEL_MAP, CURSOR_WORKSPACE
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -94,7 +94,8 @@ async def query_model(
     model: str,
     messages: List[Dict[str, str]],
     timeout: float = 120.0,
-    output_dir: Optional[str] = None
+    output_dir: Optional[str] = None,
+    workspace: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Query a single model via Cursor CLI.
@@ -130,7 +131,10 @@ async def query_model(
     try:
         # Use stdin to pass the query to avoid shell escaping issues
         # cursor agent --model <model> --print - > output_file
-        cmd = f'cursor agent --model "{cursor_model}" --print - > "{output_file}"'
+        # Use workspace from parameter, fallback to config, or None
+        effective_workspace = workspace or CURSOR_WORKSPACE
+        workspace_flag = f' --workspace "{effective_workspace}"' if effective_workspace else ""
+        cmd = f'cursor agent --model "{cursor_model}" --print{workspace_flag} - > "{output_file}"'
         logger.info(f"Executing command: {cmd}")
         logger.info(f"Full command details:")
         logger.info(f"  - Model identifier: {model}")
@@ -139,6 +143,7 @@ async def query_model(
         logger.info(f"  - Query length: {len(query)} characters")
         logger.info(f"  - Query preview: {query[:200]}...")
         logger.info(f"  - Output file: {output_file}")
+        logger.info(f"  - Workspace: {effective_workspace if effective_workspace else '(current directory)'}")
         logger.info(f"  - Timeout: {timeout}s")
         
         process = await asyncio.create_subprocess_shell(
@@ -205,7 +210,8 @@ async def query_models_parallel(
     models: List[str],
     messages: List[Dict[str, str]],
     output_dir: Optional[str] = None,
-    timeout: float = 180.0
+    timeout: float = 180.0,
+    workspace: Optional[str] = None
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
     Query multiple models in parallel using Cursor CLI.
@@ -248,7 +254,10 @@ async def query_models_parallel(
         # Build command: cursor agent --model MODEL --print -
         # Capture stdout directly instead of redirecting to file
         # This avoids issues with some models that may not write properly to redirected files
-        cmd = f'cursor agent --model "{cursor_model}" --print -'
+        # Use workspace from parameter, fallback to config, or None
+        effective_workspace = workspace or CURSOR_WORKSPACE
+        workspace_flag = f' --workspace "{effective_workspace}"' if effective_workspace else ""
+        cmd = f'cursor agent --model "{cursor_model}" --print{workspace_flag} -'
         logger.info(f"Executing command for {model}: {cmd}")
         logger.info(f"Full command details for {model}:")
         logger.info(f"  - Model identifier: {model}")
@@ -257,6 +266,7 @@ async def query_models_parallel(
         logger.info(f"  - Query length: {len(query)} characters")
         logger.info(f"  - Query preview: {query[:200]}...")
         logger.info(f"  - Output file: {output_file}")
+        logger.info(f"  - Workspace: {effective_workspace if effective_workspace else '(current directory)'}")
         
         # Start process in background with stdin
         process = await asyncio.create_subprocess_shell(
@@ -275,29 +285,112 @@ async def query_models_parallel(
         try:
             logger.info(f"Waiting for {model} to complete (timeout: {timeout}s)...")
             logger.debug(f"Sending query to {model} ({len(query_bytes)} bytes)")
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=query_bytes),
-                timeout=timeout
-            )
+            
+            # Send query to stdin and close it
+            try:
+                process.stdin.write(query_bytes)
+                await process.stdin.drain()
+                process.stdin.close()
+            except Exception as stdin_error:
+                logger.warning(f"Error writing to stdin for {model}: {stdin_error}")
+            
+            # Read stdout and stderr asynchronously to monitor progress
+            stdout_chunks = []
+            stderr_chunks = []
+            start_time = asyncio.get_event_loop().time()
+            
+            async def read_stream(stream, chunks_list, stream_name):
+                """Read from a stream and collect chunks."""
+                try:
+                    while True:
+                        chunk = await stream.read(4096)  # Read in 4KB chunks
+                        if not chunk:
+                            break
+                        chunks_list.append(chunk)
+                        elapsed = asyncio.get_event_loop().time() - start_time
+                        total_bytes = sum(len(c) for c in chunks_list)
+                        
+                        # Show preview of content (first 200 chars of accumulated output)
+                        if stream_name == "stdout" and chunks_list:
+                            try:
+                                accumulated = b''.join(chunks_list).decode('utf-8', errors='ignore')
+                                preview = accumulated[:200].replace('\n', '\\n')
+                                logger.info(f"{model} {stream_name}: received {len(chunk)} bytes (total: {total_bytes} bytes, elapsed: {elapsed:.1f}s) | Preview: {preview}...")
+                            except:
+                                logger.info(f"{model} {stream_name}: received {len(chunk)} bytes (total: {total_bytes} bytes, elapsed: {elapsed:.1f}s)")
+                        else:
+                            logger.info(f"{model} {stream_name}: received {len(chunk)} bytes (total: {total_bytes} bytes, elapsed: {elapsed:.1f}s)")
+                except Exception as e:
+                    logger.warning(f"Error reading {stream_name} for {model}: {e}")
+            
+            # Start reading both streams concurrently
+            stdout_task = asyncio.create_task(read_stream(process.stdout, stdout_chunks, "stdout"))
+            stderr_task = asyncio.create_task(read_stream(process.stderr, stderr_chunks, "stderr"))
+            
+            # Wait for process to complete
+            try:
+                returncode = await asyncio.wait_for(process.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                # Cancel reading tasks
+                stdout_task.cancel()
+                stderr_task.cancel()
+                raise
+            
+            # Wait for streams to finish reading
+            await stdout_task
+            await stderr_task
+            
+            # Combine chunks
+            stdout = b''.join(stdout_chunks) if stdout_chunks else b''
+            stderr = b''.join(stderr_chunks) if stderr_chunks else b''
+            
+            elapsed = asyncio.get_event_loop().time() - start_time
+            logger.info(f"{model} completed: returncode={returncode}, stdout={len(stdout)} bytes, stderr={len(stderr)} bytes, elapsed={elapsed:.1f}s")
+            
+            # Log stderr if there's an error
+            if returncode != 0:
+                stderr_text = stderr.decode('utf-8', errors='ignore') if stderr else ''
+                logger.error(f"{model} failed with returncode {returncode}")
+                if stderr_text:
+                    logger.error(f"{model} stderr: {stderr_text[:500]}")  # First 500 chars
+                if stdout:
+                    stdout_text = stdout.decode('utf-8', errors='ignore')
+                    logger.error(f"{model} stdout (partial): {stdout_text[:500]}")
+            
             return (model, process, stdout, stderr, None)
         except asyncio.TimeoutError:
             logger.error(f"Timeout waiting for {model} after {timeout}s - killing process")
             try:
                 # Try to get any partial output before killing
                 try:
-                    process.stdin.close()
+                    if process.stdin and not process.stdin.is_closing():
+                        process.stdin.close()
                 except:
                     pass
+                
+                # Try to read any remaining stdout/stderr before killing
+                partial_stdout = b''
+                partial_stderr = b''
+                try:
+                    if process.stdout:
+                        partial_stdout = await asyncio.wait_for(process.stdout.read(), timeout=1.0)
+                    if process.stderr:
+                        partial_stderr = await asyncio.wait_for(process.stderr.read(), timeout=1.0)
+                except:
+                    pass
+                
                 process.kill()
                 await asyncio.wait_for(process.wait(), timeout=5.0)
-                # Try to read any buffered output
-                if process.stdout:
-                    try:
-                        stdout_data = await asyncio.wait_for(process.stdout.read(), timeout=1.0)
-                        if stdout_data:
-                            logger.warning(f"Got partial stdout from {model} after timeout: {len(stdout_data)} bytes")
-                    except:
-                        pass
+                
+                # Log partial output
+                if partial_stdout:
+                    logger.warning(f"{model} partial stdout after timeout: {len(partial_stdout)} bytes")
+                    stdout_text = partial_stdout.decode('utf-8', errors='ignore')
+                    logger.warning(f"{model} partial stdout content: {stdout_text[:500]}")
+                if partial_stderr:
+                    logger.warning(f"{model} partial stderr after timeout: {len(partial_stderr)} bytes")
+                    stderr_text = partial_stderr.decode('utf-8', errors='ignore')
+                    logger.warning(f"{model} partial stderr content: {stderr_text[:500]}")
             except Exception as kill_error:
                 logger.warning(f"Error killing process for {model}: {kill_error}")
             return (model, process, None, None, TimeoutError(f"Timeout after {timeout}s"))
@@ -316,16 +409,56 @@ async def query_models_parallel(
             if error:
                 error_msg = str(error)
                 logger.error(f"Error waiting for {model}: {error_msg}")
+                
+                # Log stderr if available
+                if stderr:
+                    stderr_text = stderr.decode('utf-8', errors='ignore') if isinstance(stderr, bytes) else str(stderr)
+                    if stderr_text:
+                        logger.error(f"{model} stderr content: {stderr_text[:1000]}")
+                
+                # Log stdout if available (might contain error info)
+                if stdout:
+                    stdout_text = stdout.decode('utf-8', errors='ignore') if isinstance(stdout, bytes) else str(stdout)
+                    if stdout_text:
+                        logger.error(f"{model} stdout content: {stdout_text[:1000]}")
+                
                 # Write error info to file for debugging
                 output_file = model_to_file.get(model)
                 if output_file:
                     try:
                         with open(output_file, 'w', encoding='utf-8') as f:
-                            f.write(f"ERROR: {error_msg}\n")
+                            f.write(f"ERROR: {error_msg}\n\n")
                             if stderr:
                                 stderr_text = stderr.decode('utf-8', errors='ignore') if isinstance(stderr, bytes) else str(stderr)
                                 if stderr_text:
-                                    f.write(f"\nStderr:\n{stderr_text}\n")
+                                    f.write(f"Stderr:\n{stderr_text}\n\n")
+                            if stdout:
+                                stdout_text = stdout.decode('utf-8', errors='ignore') if isinstance(stdout, bytes) else str(stdout)
+                                if stdout_text:
+                                    f.write(f"Stdout:\n{stdout_text}\n")
+                        logger.info(f"Wrote error info to {output_file}")
+                    except Exception as write_error:
+                        logger.warning(f"Failed to write error file for {model}: {write_error}")
+                results[model] = None
+                continue
+            
+            # Check return code
+            if process.returncode != 0:
+                stderr_text = stderr.decode('utf-8', errors='ignore') if stderr else ''
+                stdout_text = stdout.decode('utf-8', errors='ignore') if stdout else ''
+                logger.error(f"Error running Cursor CLI for model {model} (returncode {process.returncode}): {stderr_text[:200] if stderr_text else 'Unknown error'}")
+                logger.error(f"{model} full stderr: {stderr_text}")
+                logger.error(f"{model} full stdout: {stdout_text}")
+                # Write error to file
+                output_file = model_to_file.get(model)
+                if output_file:
+                    try:
+                        with open(output_file, 'w', encoding='utf-8') as f:
+                            f.write(f"ERROR: Process exited with returncode {process.returncode}\n\n")
+                            if stderr_text:
+                                f.write(f"Stderr:\n{stderr_text}\n\n")
+                            if stdout_text:
+                                f.write(f"Stdout:\n{stdout_text}\n")
                         logger.info(f"Wrote error info to {output_file}")
                     except Exception as write_error:
                         logger.warning(f"Failed to write error file for {model}: {write_error}")

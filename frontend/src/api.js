@@ -67,13 +67,45 @@ export const api = {
   },
 
   /**
+   * List available workspace directories.
+   */
+  async listWorkspaces() {
+    const response = await fetch(`${API_BASE}/api/workspaces`);
+    if (!response.ok) {
+      throw new Error('Failed to list workspaces');
+    }
+    return response.json();
+  },
+
+  /**
+   * Set workspace for a conversation.
+   */
+  async setConversationWorkspace(conversationId, workspace) {
+    const response = await fetch(
+      `${API_BASE}/api/conversations/${conversationId}/workspace`,
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ workspace }),
+      }
+    );
+    if (!response.ok) {
+      throw new Error('Failed to set workspace');
+    }
+    return response.json();
+  },
+
+  /**
    * Send a message and receive streaming updates.
    * @param {string} conversationId - The conversation ID
    * @param {string} content - The message content
    * @param {function} onEvent - Callback function for each event: (eventType, data) => void
+   * @param {string} workspace - Optional workspace path
    * @returns {Promise<void>}
    */
-  async sendMessageStream(conversationId, content, onEvent) {
+  async sendMessageStream(conversationId, content, onEvent, workspace = null) {
     const response = await fetch(
       `${API_BASE}/api/conversations/${conversationId}/message/stream`,
       {
@@ -81,7 +113,7 @@ export const api = {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({ content, workspace }),
       }
     );
 

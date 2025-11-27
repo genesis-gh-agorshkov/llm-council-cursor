@@ -4,11 +4,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import uuid
 import json
 import asyncio
 import logging
+import os
+from pathlib import Path
 
 from . import storage
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
@@ -40,6 +42,7 @@ class CreateConversationRequest(BaseModel):
 class SendMessageRequest(BaseModel):
     """Request to send a message in a conversation."""
     content: str
+    workspace: Optional[str] = None  # Optional workspace override
 
 
 class ConversationMetadata(BaseModel):
@@ -56,6 +59,12 @@ class Conversation(BaseModel):
     created_at: str
     title: str
     messages: List[Dict[str, Any]]
+    workspace: Optional[str] = None
+
+
+class SetWorkspaceRequest(BaseModel):
+    """Request to set workspace for a conversation."""
+    workspace: Optional[str] = None
 
 
 @app.get("/")
@@ -87,6 +96,61 @@ async def get_conversation(conversation_id: str):
     return conversation
 
 
+@app.get("/api/workspaces")
+async def list_workspaces():
+    """
+    List available workspace directories one level up from server's working directory.
+    Returns list of directory paths.
+    """
+    try:
+        # Get the server's current working directory
+        server_dir = os.getcwd()
+        parent_dir = os.path.dirname(server_dir)
+        
+        logger.info(f"Listing workspaces in parent directory: {parent_dir}")
+        
+        # List all directories in the parent directory
+        workspaces = []
+        if os.path.exists(parent_dir) and os.path.isdir(parent_dir):
+            for item in os.listdir(parent_dir):
+                item_path = os.path.join(parent_dir, item)
+                if os.path.isdir(item_path):
+                    workspaces.append({
+                        "path": item_path,
+                        "name": item
+                    })
+        
+        # Sort by name
+        workspaces.sort(key=lambda x: x["name"])
+        
+        logger.info(f"Found {len(workspaces)} workspace directories")
+        return {"workspaces": workspaces, "parent_dir": parent_dir}
+    except Exception as e:
+        logger.exception(f"Error listing workspaces: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list workspaces: {str(e)}")
+
+
+@app.put("/api/conversations/{conversation_id}/workspace")
+async def set_conversation_workspace(conversation_id: str, request: SetWorkspaceRequest):
+    """Set the workspace directory for a conversation."""
+    conversation = storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    
+    # Validate workspace path if provided
+    if request.workspace:
+        if not os.path.exists(request.workspace):
+            raise HTTPException(status_code=400, detail=f"Workspace path does not exist: {request.workspace}")
+        if not os.path.isdir(request.workspace):
+            raise HTTPException(status_code=400, detail=f"Workspace path is not a directory: {request.workspace}")
+    
+    storage.update_conversation_workspace(conversation_id, request.workspace)
+    logger.info(f"Set workspace for conversation {conversation_id}: {request.workspace}")
+    
+    updated_conversation = storage.get_conversation(conversation_id)
+    return updated_conversation
+
+
 @app.post("/api/conversations/{conversation_id}/message")
 async def send_message(conversation_id: str, request: SendMessageRequest):
     """
@@ -100,18 +164,25 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
 
     # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0
+    
+    # Get workspace from request or conversation
+    workspace = request.workspace or conversation.get("workspace")
+    
+    # Update workspace if provided in request
+    if request.workspace is not None:
+        storage.update_conversation_workspace(conversation_id, request.workspace)
 
     # Add user message
     storage.add_user_message(conversation_id, request.content)
 
     # If this is the first message, generate a title
     if is_first_message:
-        title = await generate_conversation_title(request.content)
+        title = await generate_conversation_title(request.content, workspace=workspace)
         storage.update_conversation_title(conversation_id, title)
 
     # Run the 3-stage council process
     stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
-        request.content
+        request.content, workspace=workspace
     )
 
     # Add assistant message with all stages
@@ -149,30 +220,41 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
     # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0
     logger.info(f"Is first message: {is_first_message}")
+    
+    # Get workspace from request or conversation
+    workspace = request.workspace or conversation.get("workspace")
+    if workspace:
+        logger.info(f"Using workspace: {workspace}")
+    else:
+        logger.info("No workspace specified, using default")
 
     async def event_generator():
         try:
             # Add user message
             logger.info("Adding user message to conversation")
             storage.add_user_message(conversation_id, request.content)
+            
+            # Update workspace if provided in request
+            if request.workspace is not None:
+                storage.update_conversation_workspace(conversation_id, request.workspace)
 
             # Start title generation in parallel (don't await yet)
             title_task = None
             if is_first_message:
                 logger.info("Starting title generation task")
-                title_task = asyncio.create_task(generate_conversation_title(request.content))
+                title_task = asyncio.create_task(generate_conversation_title(request.content, workspace=workspace))
 
             # Stage 1: Collect responses
             logger.info("Starting Stage 1: Collecting responses")
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(request.content)
+            stage1_results = await stage1_collect_responses(request.content, workspace=workspace)
             logger.info(f"Stage 1 completed with {len(stage1_results)} results")
             yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
 
             # Stage 2: Collect rankings
             logger.info("Starting Stage 2: Collecting rankings")
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
+            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results, workspace=workspace)
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
             logger.info(f"Stage 2 completed with {len(stage2_results)} rankings")
             yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
@@ -180,7 +262,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             # Stage 3: Synthesize final answer
             logger.info("Starting Stage 3: Synthesizing final answer")
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results, workspace=workspace)
             logger.info("Stage 3 completed")
             yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
 

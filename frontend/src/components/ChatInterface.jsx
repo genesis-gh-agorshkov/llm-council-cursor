@@ -9,6 +9,9 @@ export default function ChatInterface({
   conversation,
   onSendMessage,
   isLoading,
+  workspaces = [],
+  selectedWorkspace = null,
+  onWorkspaceChange = null,
 }) {
   const [input, setInput] = useState('');
   const messagesEndRef = useRef(null);
@@ -122,22 +125,43 @@ export default function ChatInterface({
 
       {conversation.messages.length === 0 && (
         <form className="input-form" onSubmit={handleSubmit}>
-          <textarea
-            className="message-input"
-            placeholder="Ask your question... (Shift+Enter for new line, Enter to send)"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            disabled={isLoading}
-            rows={3}
-          />
-          <button
-            type="submit"
-            className="send-button"
-            disabled={!input.trim() || isLoading}
-          >
-            Send
-          </button>
+          {workspaces.length > 0 && (
+            <div className="workspace-selector">
+              <label htmlFor="workspace-select">Workspace:</label>
+              <select
+                id="workspace-select"
+                className="workspace-select"
+                value={selectedWorkspace || ''}
+                onChange={(e) => onWorkspaceChange && onWorkspaceChange(e.target.value || null)}
+                disabled={isLoading}
+              >
+                <option value="">(Current Directory)</option>
+                {workspaces.map((ws) => (
+                  <option key={ws.path} value={ws.path}>
+                    {ws.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          <div className="input-form-row">
+            <textarea
+              className="message-input"
+              placeholder="Ask your question... (Shift+Enter for new line, Enter to send)"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              disabled={isLoading}
+              rows={3}
+            />
+            <button
+              type="submit"
+              className="send-button"
+              disabled={!input.trim() || isLoading}
+            >
+              Send
+            </button>
+          </div>
         </form>
       )}
     </div>

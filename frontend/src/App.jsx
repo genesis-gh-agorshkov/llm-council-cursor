@@ -9,10 +9,18 @@ function App() {
   const [currentConversationId, setCurrentConversationId] = useState(null);
   const [currentConversation, setCurrentConversation] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [workspaces, setWorkspaces] = useState([]);
+  const [selectedWorkspace, setSelectedWorkspace] = useState(null);
 
-  // Load conversations on mount
+  // Load conversations and workspaces on mount
   useEffect(() => {
     loadConversations();
+    loadWorkspaces();
+    
+    // Request notification permission on mount
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
   }, []);
 
   // Load conversation details when selected
@@ -35,8 +43,34 @@ function App() {
     try {
       const conv = await api.getConversation(id);
       setCurrentConversation(conv);
+      // Set workspace from conversation if available
+      if (conv.workspace) {
+        setSelectedWorkspace(conv.workspace);
+      }
     } catch (error) {
       console.error('Failed to load conversation:', error);
+    }
+  };
+
+  const loadWorkspaces = async () => {
+    try {
+      const data = await api.listWorkspaces();
+      setWorkspaces(data.workspaces || []);
+    } catch (error) {
+      console.error('Failed to load workspaces:', error);
+    }
+  };
+
+  const handleWorkspaceChange = async (workspace) => {
+    setSelectedWorkspace(workspace);
+    if (currentConversationId) {
+      try {
+        await api.setConversationWorkspace(currentConversationId, workspace);
+        // Reload conversation to get updated workspace
+        await loadConversation(currentConversationId);
+      } catch (error) {
+        console.error('Failed to set workspace:', error);
+      }
     }
   };
 
@@ -89,7 +123,7 @@ function App() {
         messages: [...prev.messages, assistantMessage],
       }));
 
-      // Send message with streaming
+      // Send message with streaming (include workspace)
       await api.sendMessageStream(currentConversationId, content, (eventType, event) => {
         switch (eventType) {
           case 'stage1_start':
@@ -148,6 +182,26 @@ function App() {
               lastMsg.loading.stage3 = false;
               return { ...prev, messages };
             });
+            // Show browser notification when chairman presents final answer
+            if ('Notification' in window && Notification.permission === 'granted') {
+              try {
+                const notification = new Notification('LLM Council - Final Answer Ready', {
+                  body: 'The chairman has synthesized the final response from all council members.',
+                  icon: '/favicon.ico', // You can add a custom icon later
+                  badge: '/favicon.ico',
+                  tag: 'llm-council-complete',
+                  requireInteraction: false,
+                  silent: false,
+                });
+                
+                // Auto-close after 5 seconds
+                setTimeout(() => {
+                  notification.close();
+                }, 5000);
+              } catch (error) {
+                console.error('Failed to show notification:', error);
+              }
+            }
             break;
 
           case 'title_complete':
@@ -169,7 +223,7 @@ function App() {
           default:
             console.log('Unknown event type:', eventType);
         }
-      });
+      }, selectedWorkspace);
     } catch (error) {
       console.error('Failed to send message:', error);
       // Remove optimistic messages on error
@@ -193,6 +247,9 @@ function App() {
         conversation={currentConversation}
         onSendMessage={handleSendMessage}
         isLoading={isLoading}
+        workspaces={workspaces}
+        selectedWorkspace={selectedWorkspace}
+        onWorkspaceChange={handleWorkspaceChange}
       />
     </div>
   );
