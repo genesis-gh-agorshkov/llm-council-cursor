@@ -1,4 +1,6 @@
-# LLM Council
+# LLM Council - fork w/ Cursor CLI back-end
+
+Same as original, except Cursor CLI as back-end + allow setting of working directory for your project.
 
 ![llmcouncil](header.jpg)
 
