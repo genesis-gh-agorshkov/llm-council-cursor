@@ -1,8 +1,13 @@
 """3-stage LLM Council orchestration."""
 
 from typing import List, Dict, Any, Tuple
-from .openrouter import query_models_parallel, query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+import os
+import tempfile
+import logging
+from .cursor_cli import query_models_parallel, query_model
+from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, CURSOR_OUTPUT_DIR
+
+logger = logging.getLogger(__name__)
 
 
 async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
@@ -15,10 +20,21 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
     Returns:
         List of dicts with 'model' and 'response' keys
     """
+    logger.info(f"Stage 1: Starting collection of responses from {len(COUNCIL_MODELS)} models")
+    logger.info(f"User query: {user_query[:100]}...")
+    
     messages = [{"role": "user", "content": user_query}]
 
+    # Create output directory for stage 1
+    base_dir = CURSOR_OUTPUT_DIR if os.path.exists(CURSOR_OUTPUT_DIR) else None
+    if base_dir:
+        os.makedirs(base_dir, exist_ok=True)
+    output_dir = tempfile.mkdtemp(prefix="stage1_", dir=base_dir)
+    logger.info(f"Stage 1 output directory: {output_dir}")
+
     # Query all models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    logger.info(f"Stage 1: Querying models: {COUNCIL_MODELS}")
+    responses = await query_models_parallel(COUNCIL_MODELS, messages, output_dir=output_dir)
 
     # Format results
     stage1_results = []
@@ -28,7 +44,11 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
                 "model": model,
                 "response": response.get('content', '')
             })
+            logger.info(f"Stage 1: Successfully got response from {model} ({len(response.get('content', ''))} chars)")
+        else:
+            logger.warning(f"Stage 1: Failed to get response from {model}")
 
+    logger.info(f"Stage 1: Completed. Got {len(stage1_results)}/{len(COUNCIL_MODELS)} successful responses")
     return stage1_results
 
 
@@ -46,6 +66,9 @@ async def stage2_collect_rankings(
     Returns:
         Tuple of (rankings list, label_to_model mapping)
     """
+    logger.info(f"Stage 2: Starting collection of rankings from {len(COUNCIL_MODELS)} models")
+    logger.info(f"Stage 2: Ranking {len(stage1_results)} responses from Stage 1")
+    
     # Create anonymized labels for responses (Response A, Response B, etc.)
     labels = [chr(65 + i) for i in range(len(stage1_results))]  # A, B, C, ...
 
@@ -94,8 +117,16 @@ Now provide your evaluation and ranking:"""
 
     messages = [{"role": "user", "content": ranking_prompt}]
 
+    # Create output directory for stage 2
+    base_dir = CURSOR_OUTPUT_DIR if os.path.exists(CURSOR_OUTPUT_DIR) else None
+    if base_dir:
+        os.makedirs(base_dir, exist_ok=True)
+    output_dir = tempfile.mkdtemp(prefix="stage2_", dir=base_dir)
+    logger.info(f"Stage 2 output directory: {output_dir}")
+
     # Get rankings from all council models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    logger.info(f"Stage 2: Querying models for rankings: {COUNCIL_MODELS}")
+    responses = await query_models_parallel(COUNCIL_MODELS, messages, output_dir=output_dir)
 
     # Format results
     stage2_results = []
@@ -108,7 +139,11 @@ Now provide your evaluation and ranking:"""
                 "ranking": full_text,
                 "parsed_ranking": parsed
             })
+            logger.info(f"Stage 2: Successfully got ranking from {model}, parsed {len(parsed)} rankings")
+        else:
+            logger.warning(f"Stage 2: Failed to get ranking from {model}")
 
+    logger.info(f"Stage 2: Completed. Got {len(stage2_results)}/{len(COUNCIL_MODELS)} successful rankings")
     return stage2_results, label_to_model
 
 
@@ -158,16 +193,26 @@ Provide a clear, well-reasoned final answer that represents the council's collec
 
     messages = [{"role": "user", "content": chairman_prompt}]
 
+    # Create output directory for stage 3 (chairman)
+    base_dir = CURSOR_OUTPUT_DIR if os.path.exists(CURSOR_OUTPUT_DIR) else None
+    if base_dir:
+        os.makedirs(base_dir, exist_ok=True)
+    output_dir = tempfile.mkdtemp(prefix="stage3_", dir=base_dir)
+    logger.info(f"Stage 3 output directory: {output_dir}")
+
     # Query the chairman model
-    response = await query_model(CHAIRMAN_MODEL, messages)
+    logger.info(f"Stage 3: Querying chairman model {CHAIRMAN_MODEL}")
+    response = await query_model(CHAIRMAN_MODEL, messages, output_dir=output_dir)
 
     if response is None:
         # Fallback if chairman fails
+        logger.error(f"Stage 3: Chairman model {CHAIRMAN_MODEL} failed to generate response")
         return {
             "model": CHAIRMAN_MODEL,
             "response": "Error: Unable to generate final synthesis."
         }
 
+    logger.info(f"Stage 3: Successfully got response from chairman ({len(response.get('content', ''))} chars)")
     return {
         "model": CHAIRMAN_MODEL,
         "response": response.get('content', '')
@@ -274,8 +319,14 @@ Title:"""
 
     messages = [{"role": "user", "content": title_prompt}]
 
+    # Create output directory for title generation
+    base_dir = CURSOR_OUTPUT_DIR if os.path.exists(CURSOR_OUTPUT_DIR) else None
+    if base_dir:
+        os.makedirs(base_dir, exist_ok=True)
+    output_dir = tempfile.mkdtemp(prefix="title_", dir=base_dir)
+
     # Use gemini-2.5-flash for title generation (fast and cheap)
-    response = await query_model("google/gemini-2.5-flash", messages, timeout=30.0)
+    response = await query_model("google/gemini-2.5-flash", messages, timeout=30.0, output_dir=output_dir)
 
     if response is None:
         # Fallback to a generic title
